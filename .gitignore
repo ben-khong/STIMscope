@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 *.so
+*.dylib
+*.pyd
+clpipe/_native*
 .pytest_cache/
 .venv/
 venv/
