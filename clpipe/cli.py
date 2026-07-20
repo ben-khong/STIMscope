@@ -6,6 +6,8 @@ import argparse
 import sys
 from typing import Optional, Sequence
 
+from .background import BackgroundStage
+from .native import describe
 from .pipeline import Pipeline
 from .quality import IntensityGate, QualityStage
 from .sources import CameraSource, FrameSource, SyntheticSource
@@ -31,6 +33,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--free-run", action="store_true",
                         help="synthetic source only: generate as fast as possible")
     parser.add_argument("--verbose", action="store_true", help="log every rejected frame")
+
+    background = parser.add_argument_group("background subtraction")
+    background.add_argument("--background", action="store_true",
+                            help="run background subtraction on frames that pass the gate")
+    background.add_argument("--alpha", type=float, default=0.05,
+                            help="background model learning rate")
+    background.add_argument("--bg-threshold", type=int, default=25,
+                            help="per-pixel deviation counted as foreground")
+    background.add_argument("--backend", choices=("numpy", "cpp", "cuda"), default=None,
+                            help="force a backend instead of picking the best available")
     return parser
 
 
@@ -64,6 +76,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         stage.gate = _wrapped  # type: ignore[assignment]
 
+    background: BackgroundStage | None = None
+    if args.background:
+        background = BackgroundStage(
+            alpha=args.alpha, threshold=args.bg_threshold, force_backend=args.backend
+        )
+        stage.downstream = lambda frame, report: background(frame, report)
+
     source = build_source(args)
     pipeline = Pipeline(
         source,
@@ -72,12 +91,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         drop_when_full=not args.no_drop,
     )
 
+    print(describe())
     print(f"running {args.source} source, queue depth {args.queue_size}, "
           f"drop_when_full={not args.no_drop}")
     metrics = pipeline.run()
 
     print(metrics.summary())
     print(f"gate: accepted={stage.accepted} rejected={stage.rejected} {stage.reasons or ''}")
+    if background is not None:
+        print(f"background: backend={background.backend} frames={background.frames} "
+              f"mean foreground={background.mean_foreground_fraction:.2%}")
     return 0
 
 
