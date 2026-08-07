@@ -36,6 +36,37 @@ else()
     message(STATUS "clpipe: CUDA not found, building the CPU-only extension")
 endif()
 
+# ---------------------------------------------------------------------------
+# ONNX Runtime is optional and, unlike CUDA, has to be pointed at.
+#
+# There is no reliable system-wide install location for the C++ SDK, so the
+# path comes from -DCLPIPE_ONNXRUNTIME_ROOT=/path/to/onnxruntime (the extracted
+# release tarball) or the ONNXRUNTIME_ROOT environment variable. Without it the
+# extension builds with only the analytic segmenter, and asking for a .onnx
+# model at runtime raises instead of silently substituting it.
+# ---------------------------------------------------------------------------
+if(NOT CLPIPE_ONNXRUNTIME_ROOT AND DEFINED ENV{ONNXRUNTIME_ROOT})
+    set(CLPIPE_ONNXRUNTIME_ROOT "$ENV{ONNXRUNTIME_ROOT}")
+endif()
+
+set(CLPIPE_WITH_ONNXRUNTIME OFF)
+if(CLPIPE_ONNXRUNTIME_ROOT)
+    find_path(ORT_INCLUDE_DIR onnxruntime_cxx_api.h
+        HINTS "${CLPIPE_ONNXRUNTIME_ROOT}/include" NO_DEFAULT_PATH)
+    find_library(ORT_LIBRARY NAMES onnxruntime
+        HINTS "${CLPIPE_ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH)
+
+    if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
+        set(CLPIPE_WITH_ONNXRUNTIME ON)
+        message(STATUS "clpipe: ONNX Runtime enabled (${ORT_LIBRARY})")
+    else()
+        message(FATAL_ERROR
+            "CLPIPE_ONNXRUNTIME_ROOT=${CLPIPE_ONNXRUNTIME_ROOT} but no headers/library found there.")
+    endif()
+else()
+    message(STATUS "clpipe: ONNX Runtime not configured, analytic segmenter only")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -52,8 +83,16 @@ find_package(pybind11 CONFIG REQUIRED)
 set(CLPIPE_SOURCES
     cpp/src/background.cpp
     cpp/src/background_cpu.cpp
+    cpp/src/segmenter.cpp
+    cpp/src/dmd.cpp
+    cpp/src/controller.cpp
     cpp/src/bindings.cpp
+    cpp/src/bindings_loop.cpp
 )
+
+if(CLPIPE_WITH_ONNXRUNTIME)
+    list(APPEND CLPIPE_SOURCES cpp/src/segmenter_onnx.cpp)
+endif()
 
 if(CLPIPE_WITH_CUDA)
     list(APPEND CLPIPE_SOURCES cpp/src/background_cuda.cu)
@@ -70,6 +109,18 @@ if(CLPIPE_WITH_CUDA)
         # 53 = TX1/Nano, 62 = TX2, 72 = Xavier, 87 = Orin. Trim to the one board
         # you actually target to cut compile time.
         CUDA_ARCHITECTURES "53;62;72;87"
+    )
+endif()
+
+if(CLPIPE_WITH_ONNXRUNTIME)
+    target_compile_definitions(_native PRIVATE CLPIPE_WITH_ONNXRUNTIME)
+    target_include_directories(_native PRIVATE ${ORT_INCLUDE_DIR})
+    target_link_libraries(_native PRIVATE ${ORT_LIBRARY})
+    # Record where libonnxruntime lives so the extension resolves it at import
+    # time without the caller having to set LD_LIBRARY_PATH.
+    set_target_properties(_native PROPERTIES
+        BUILD_RPATH "${CLPIPE_ONNXRUNTIME_ROOT}/lib"
+        INSTALL_RPATH "${CLPIPE_ONNXRUNTIME_ROOT}/lib"
     )
 endif()
 
