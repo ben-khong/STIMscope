@@ -24,6 +24,11 @@
 
 namespace py = pybind11;
 
+// Defined in bindings_loop.cpp: segmentation, DMD and the closed-loop
+// controller. Split out so this file stays about the background-subtraction
+// surface and the zero-copy contract it documents.
+void bind_closed_loop(py::module_& m);
+
 namespace {
 
 /// Validate a 2D uint8 array and describe it as a View2D without copying.
@@ -117,4 +122,6 @@ PYBIND11_MODULE(_native, m) {
                    std::to_string(self.cols()) + " backend=" +
                    clpipe::backend_name(self.backend()) + ">";
         });
+
+    bind_closed_loop(m);
 }
