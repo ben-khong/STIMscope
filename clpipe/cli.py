@@ -7,6 +7,7 @@ import sys
 from typing import Optional, Sequence
 
 from .background import BackgroundStage
+from .closedloop import ClosedLoopStage
 from .native import describe
 from .pipeline import Pipeline
 from .quality import IntensityGate, QualityStage
@@ -43,6 +44,18 @@ def build_parser() -> argparse.ArgumentParser:
                             help="per-pixel deviation counted as foreground")
     background.add_argument("--backend", choices=("numpy", "cpp", "cuda"), default=None,
                             help="force a backend instead of picking the best available")
+
+    loop = parser.add_argument_group("closed loop")
+    loop.add_argument("--closed-loop", action="store_true",
+                      help="segment accepted frames and drive the DMD (implies --background)")
+    loop.add_argument("--segmenter", default="builtin",
+                      help="'builtin' or a path to a .onnx segmentation model")
+    loop.add_argument("--activation-threshold", type=int, default=128,
+                      help="confidence at or above which a pixel is a stimulation target")
+    loop.add_argument("--no-motion-veto", action="store_true",
+                      help="stimulate on segmentation alone, ignoring the motion mask")
+    loop.add_argument("--open-loop", action="store_true",
+                      help="run every stage but do not feed the pattern back to the sample")
     return parser
 
 
@@ -76,14 +89,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         stage.gate = _wrapped  # type: ignore[assignment]
 
+    # Built first: the closed loop needs a handle on the sample to feed the
+    # projected pattern back into it.
+    source = build_source(args)
+
+    loop: ClosedLoopStage | None = None
+    if args.closed_loop:
+        sample = source if (args.source == "synthetic" and not args.open_loop) else None
+        loop = ClosedLoopStage(
+            segmenter=args.segmenter,
+            activation_threshold=args.activation_threshold,
+            sample=sample,
+            use_motion_veto=not args.no_motion_veto,
+        )
+        stage.on_reject = lambda frame, report: loop.on_rejected_frame()
+
     background: BackgroundStage | None = None
-    if args.background:
+    if args.background or args.closed_loop:
         background = BackgroundStage(
-            alpha=args.alpha, threshold=args.bg_threshold, force_backend=args.backend
+            alpha=args.alpha, threshold=args.bg_threshold, force_backend=args.backend,
+            downstream=loop,
         )
         stage.downstream = lambda frame, report: background(frame, report)
-
-    source = build_source(args)
     pipeline = Pipeline(
         source,
         handler=stage,
@@ -101,6 +128,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if background is not None:
         print(f"background: backend={background.backend} frames={background.frames} "
               f"mean foreground={background.mean_foreground_fraction:.2%}")
+    if loop is not None:
+        mean_stimulated = loop.stimulated_total / loop.cycles if loop.cycles else 0.0
+        print(f"loop: segmenter={loop.backend} cycles={loop.cycles} "
+              f"mean stimulated={mean_stimulated:.0f} px/frame")
+        print(f"latency: {loop.latency_summary()}")
+        if loop.sample is not None:
+            print(f"sample: peak suppression={source.suppression.max():.2f} "
+                  f"mean={source.suppression.mean():.3f}")
+        else:
+            print("sample: feedback not connected (open loop)")
     return 0
 
 

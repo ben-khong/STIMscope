@@ -95,12 +95,15 @@ class SyntheticSource(FrameSource):
         fps: float = 30.0,
         n_frames: Optional[int] = 300,
         n_blobs: int = 3,
+        sigma_range: tuple = (4.0, 12.0),
         blank_rate: float = 0.02,
         overexposed_rate: float = 0.02,
         background: int = 40,
         noise: float = 6.0,
         seed: int = 0,
         realtime: bool = True,
+        stimulus_gain: float = 0.35,
+        recovery_rate: float = 0.06,
     ) -> None:
         if not 0.0 <= blank_rate + overexposed_rate <= 1.0:
             raise ValueError("blank_rate + overexposed_rate must lie in [0, 1]")
@@ -115,10 +118,19 @@ class SyntheticSource(FrameSource):
         self.noise = noise
         self.realtime = realtime
 
+        # Response to projected light. Illuminated regions dim, then recover
+        # once the light goes away. This is a caricature of a real preparation,
+        # not a model of one -- but it has the property the loop needs: the
+        # sample's next state depends on what was projected at it, so feedback
+        # is observable instead of asserted.
+        self.stimulus_gain = stimulus_gain
+        self.recovery_rate = recovery_rate
+
         self._rng = np.random.default_rng(seed)
         self._index = 0
         self._next_deadline: Optional[float] = None
         self._closed = False
+        self._suppression = np.zeros((height, width), dtype=np.float32)
 
         # Precompute the coordinate grid once; re-deriving it per frame is the
         # single easiest way to make a synthetic source slower than the camera
@@ -134,7 +146,12 @@ class SyntheticSource(FrameSource):
             ]
         ).astype(np.float32)
         self._velocity = self._rng.normal(0.0, 1.8, (n_blobs, 2)).astype(np.float32)
-        self._sigma = self._rng.uniform(8.0, 20.0, n_blobs).astype(np.float32)
+        # Compact activity rather than broad glow. The scale matters: the
+        # segmenter downstream is a centre-surround operator with a 17-pixel
+        # outer window, and structure much wider than that is indistinguishable
+        # from illumination and is correctly ignored.
+        self._sigma = self._rng.uniform(
+            float(sigma_range[0]), float(sigma_range[1]), n_blobs).astype(np.float32)
         self._amplitude = self._rng.uniform(110.0, 190.0, n_blobs).astype(np.float32)
 
     def read(self) -> Optional[Frame]:
@@ -159,6 +176,25 @@ class SyntheticSource(FrameSource):
     def close(self) -> None:
         self._closed = True
 
+    def apply_stimulation(self, pattern: np.ndarray) -> None:
+        """Record light projected at the sample. Satisfies ``Stimulable``.
+
+        Suppression approaches 1 asymptotically under continued illumination
+        rather than climbing without bound, so a region that stays lit settles
+        instead of going negative and inverting the signal.
+        """
+        if pattern.shape != self._suppression.shape:
+            raise ValueError("stimulation pattern shape does not match the frame geometry")
+        lit = pattern > 0
+        if not lit.any():
+            return
+        self._suppression[lit] += self.stimulus_gain * (1.0 - self._suppression[lit])
+
+    @property
+    def suppression(self) -> np.ndarray:
+        """Per-pixel activity suppression, 0 (untouched) to 1 (fully damped)."""
+        return self._suppression
+
     # ------------------------------------------------------------------ #
 
     def _pace(self) -> None:
@@ -181,11 +217,20 @@ class SyntheticSource(FrameSource):
     def _render(self) -> np.ndarray:
         self._advance_blobs()
 
-        canvas = np.full((self.height, self.width), float(self.background), dtype=np.float32)
+        # Recover a little each frame. Regions no longer being illuminated drift
+        # back toward full activity, which is what makes the loop oscillate
+        # rather than latch: stimulate, dim, drop below threshold, recover.
+        if self.recovery_rate > 0:
+            self._suppression *= (1.0 - self.recovery_rate)
+
+        activity = np.zeros((self.height, self.width), dtype=np.float32)
         for (cx, cy), sigma, amp in zip(self._centers, self._sigma, self._amplitude):
             dx = self._xx - cx
             dy = self._yy - cy
-            canvas += amp * np.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma))
+            activity += amp * np.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma))
+
+        canvas = np.full((self.height, self.width), float(self.background), dtype=np.float32)
+        canvas += activity * (1.0 - self._suppression)
 
         if self.noise > 0:
             canvas += self._rng.normal(0.0, self.noise, canvas.shape).astype(np.float32)

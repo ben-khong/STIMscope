@@ -46,4 +46,9 @@ def describe() -> str:
     else:
         detail = "CPU-only build"
 
+    if native.built_with_onnxruntime():
+        detail += f", ONNX Runtime {native.onnxruntime_version()}"
+    else:
+        detail += ", analytic segmenter only"
+
     return f"native extension v{native.__version__} loaded: {detail}"

@@ -84,9 +84,14 @@ class QualityStage:
         self,
         gate: Optional[IntensityGate] = None,
         downstream: Optional[Callable[[Frame, QualityReport], None]] = None,
+        on_reject: Optional[Callable[[Frame, QualityReport], None]] = None,
     ) -> None:
         self.gate = gate or IntensityGate()
         self.downstream = downstream
+        # Rejection is not a no-op downstream. A closed-loop system holding a
+        # stale pattern on the mirrors while it cannot see the sample is worse
+        # than one that goes dark, so the hook exists to let it go dark.
+        self.on_reject = on_reject
         self.accepted = 0
         self.rejected = 0
         self.reasons: dict[str, int] = {}
@@ -98,6 +103,8 @@ class QualityStage:
             self.reasons[report.reason or "unknown"] = (
                 self.reasons.get(report.reason or "unknown", 0) + 1
             )
+            if self.on_reject is not None:
+                self.on_reject(frame, report)
             return report
 
         self.accepted += 1
